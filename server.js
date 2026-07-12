@@ -24,6 +24,14 @@ const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || null;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-image";
 
+// Cloudflare Workers AI: genuinely free tier (10k neurons/day, no card).
+// Supports text-to-image, img2img (iterative adjustment), and inpainting.
+const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID || null;
+const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN || null;
+const CF_MODEL_TEXT2IMG = "@cf/black-forest-labs/flux-1-schnell";
+const CF_MODEL_IMG2IMG = "@cf/runwayml/stable-diffusion-v1-5-img2img";
+const CF_MODEL_INPAINT = "@cf/runwayml/stable-diffusion-v1-5-inpainting";
+
 const MAX_BYTES = 15 * 1024 * 1024; // 15MB safety cap
 
 function isAllowedUrl(raw) {
@@ -285,6 +293,156 @@ function buildServer() {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({ message: `relay: gemini output ${filename}`, content: outBuf.toString("base64"), branch: GITHUB_BRANCH }),
+        });
+        if (!putRes.ok) {
+          const errText = await putRes.text();
+          return { isError: true, content: [{ type: "text", text: `GitHub push failed: HTTP ${putRes.status} ${errText.slice(0, 300)}` }] };
+        }
+        const rawUrl = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${path}`;
+        return { content: [{ type: "text", text: rawUrl }] };
+      }
+
+      return { content: [{ type: "image", data: outBuf.toString("base64"), mimeType: outMime }] };
+    }
+  );
+
+  server.registerTool(
+    "cloudflare_generate_image",
+    {
+      title: "Generate or edit an image with Cloudflare Workers AI (free)",
+      description:
+        "Generates or edits an image using Cloudflare Workers AI's free tier (10k " +
+        "requests/day, no billing card, separate quota from both Hugging Face and " +
+        "Gemini). Three modes based on what's provided: (1) prompt only -> generates " +
+        "a new image (FLUX schnell). (2) prompt + input image -> img2img, transforms " +
+        "the input toward the prompt; use 'strength' to control how much changes (low " +
+        "= subtle adjustment, high = big change) — this is the 'generate then adjust' " +
+        "loop: feed a previous output back in as the next input_image_b64. (3) prompt + " +
+        "input image + mask -> inpainting, only repaints the masked region (mask: white " +
+        "= area to change, black = area to keep).",
+      inputSchema: {
+        prompt: z.string().describe("Text description of the image, or the edit to apply"),
+        input_image_url: z
+          .string()
+          .url()
+          .optional()
+          .describe("Optional: public URL of an image to edit (must be an allowed host)"),
+        input_image_b64: z
+          .string()
+          .optional()
+          .describe("Optional: raw base64 image data to edit (preferred for private photos)"),
+        mask_b64: z
+          .string()
+          .optional()
+          .describe("Optional: raw base64 mask for inpainting (white=change, black=keep). Requires an input image."),
+        strength: z
+          .number()
+          .min(0)
+          .max(1)
+          .optional()
+          .describe("For img2img: 0-1, how strongly to transform vs keep the original. Default 0.8."),
+        push_to_github: z
+          .boolean()
+          .optional()
+          .describe("If true, push the result to GitHub and return a raw URL instead of inline image content"),
+        filename: z
+          .string()
+          .regex(/^[a-zA-Z0-9._-]+$/)
+          .optional()
+          .describe("Required if push_to_github is true"),
+      },
+    },
+    async ({ prompt, input_image_url, input_image_b64, mask_b64, strength, push_to_github, filename }) => {
+      if (!CLOUDFLARE_ACCOUNT_ID || !CLOUDFLARE_API_TOKEN) {
+        return { isError: true, content: [{ type: "text", text: "Server missing CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN config." }] };
+      }
+
+      let imageBytes = null;
+      if (input_image_url) {
+        if (!isAllowedUrl(input_image_url)) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Refused: host not on allowlist (${ALLOWED_HOST_SUFFIXES.join(", ")})` }],
+          };
+        }
+        const imgRes = await fetch(input_image_url);
+        if (!imgRes.ok) {
+          return { isError: true, content: [{ type: "text", text: `Fetch failed: HTTP ${imgRes.status}` }] };
+        }
+        imageBytes = Buffer.from(await imgRes.arrayBuffer());
+      } else if (input_image_b64) {
+        imageBytes = Buffer.from(input_image_b64, "base64");
+      }
+
+      let model, body;
+      if (mask_b64 && imageBytes) {
+        model = CF_MODEL_INPAINT;
+        body = {
+          prompt,
+          image: Array.from(imageBytes),
+          mask: Array.from(Buffer.from(mask_b64, "base64")),
+          strength: strength ?? 0.8,
+        };
+      } else if (imageBytes) {
+        model = CF_MODEL_IMG2IMG;
+        body = { prompt, image: Array.from(imageBytes), strength: strength ?? 0.8 };
+      } else {
+        model = CF_MODEL_TEXT2IMG;
+        body = { prompt };
+      }
+
+      const cfRes = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${model}`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }
+      );
+
+      const contentType = cfRes.headers.get("content-type") || "";
+      let outBuf, outMime;
+
+      if (contentType.includes("application/json")) {
+        const data = await cfRes.json();
+        if (!cfRes.ok || data.success === false) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Cloudflare error: HTTP ${cfRes.status} ${JSON.stringify(data.errors || data).slice(0, 400)}` }],
+          };
+        }
+        const b64 = data?.result?.image;
+        if (!b64) {
+          return { isError: true, content: [{ type: "text", text: `No image in response: ${JSON.stringify(data).slice(0, 300)}` }] };
+        }
+        outBuf = Buffer.from(b64, "base64");
+        outMime = "image/png";
+      } else {
+        if (!cfRes.ok) {
+          const errText = await cfRes.text();
+          return { isError: true, content: [{ type: "text", text: `Cloudflare error: HTTP ${cfRes.status} ${errText.slice(0, 400)}` }] };
+        }
+        outBuf = Buffer.from(await cfRes.arrayBuffer());
+        outMime = contentType || "image/png";
+      }
+
+      if (push_to_github) {
+        if (!filename) {
+          return { isError: true, content: [{ type: "text", text: "filename is required when push_to_github is true." }] };
+        }
+        if (!GITHUB_TOKEN || !GITHUB_REPO) {
+          return { isError: true, content: [{ type: "text", text: "Server missing GITHUB_TOKEN / GITHUB_REPO config." }] };
+        }
+        const path = `relay-drops/${filename}`;
+        const apiUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${path}`;
+        const putRes = await fetch(apiUrl, {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${GITHUB_TOKEN}`,
+            Accept: "application/vnd.github+json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ message: `relay: cloudflare output ${filename}`, content: outBuf.toString("base64"), branch: GITHUB_BRANCH }),
         });
         if (!putRes.ok) {
           const errText = await putRes.text();

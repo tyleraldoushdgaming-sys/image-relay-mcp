@@ -15,6 +15,11 @@ const ALLOWED_HOST_SUFFIXES = [
 // Leave unset while testing locally.
 const AUTH_TOKEN = process.env.RELAY_AUTH_TOKEN || null;
 
+// GitHub push target for relay_to_github. Repo format: "owner/repo".
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || null;
+const GITHUB_REPO = process.env.GITHUB_REPO || null;
+const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
+
 const MAX_BYTES = 15 * 1024 * 1024; // 15MB safety cap
 
 function isAllowedUrl(raw) {
@@ -85,6 +90,78 @@ function buildServer() {
           },
         ],
       };
+    }
+  );
+
+  server.registerTool(
+    "relay_to_github",
+    {
+      title: "Relay image to GitHub",
+      description:
+        "Fetches an image from an allowed host (e.g. a Hugging Face Space output) and " +
+        "pushes it into a GitHub repo, returning a raw.githubusercontent.com URL. This " +
+        "lets Claude's own sandbox (which can reach GitHub but not hf.space) pull the " +
+        "image down directly for further local editing.",
+      inputSchema: {
+        url: z.string().url().describe("Direct https URL to the source image"),
+        filename: z
+          .string()
+          .regex(/^[a-zA-Z0-9._-]+$/)
+          .describe("Filename only, e.g. 'bg-01.png'. No slashes or paths."),
+      },
+    },
+    async ({ url, filename }) => {
+      if (!isAllowedUrl(url)) {
+        return {
+          isError: true,
+          content: [
+            { type: "text", text: `Refused: host not on allowlist (${ALLOWED_HOST_SUFFIXES.join(", ")})` },
+          ],
+        };
+      }
+      if (!GITHUB_TOKEN || !GITHUB_REPO) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Server missing GITHUB_TOKEN / GITHUB_REPO config." }],
+        };
+      }
+
+      const imgRes = await fetch(url);
+      if (!imgRes.ok) {
+        return { isError: true, content: [{ type: "text", text: `Fetch failed: HTTP ${imgRes.status}` }] };
+      }
+      const buf = Buffer.from(await imgRes.arrayBuffer());
+      if (buf.byteLength > MAX_BYTES) {
+        return { isError: true, content: [{ type: "text", text: `Image too large (${buf.byteLength} bytes)` }] };
+      }
+
+      const path = `relay-drops/${filename}`;
+      const apiUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${path}`;
+
+      const putRes = await fetch(apiUrl, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${GITHUB_TOKEN}`,
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: `relay: add ${filename}`,
+          content: buf.toString("base64"),
+          branch: GITHUB_BRANCH,
+        }),
+      });
+
+      if (!putRes.ok) {
+        const errText = await putRes.text();
+        return {
+          isError: true,
+          content: [{ type: "text", text: `GitHub push failed: HTTP ${putRes.status} ${errText.slice(0, 300)}` }],
+        };
+      }
+
+      const rawUrl = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${path}`;
+      return { content: [{ type: "text", text: rawUrl }] };
     }
   );
 

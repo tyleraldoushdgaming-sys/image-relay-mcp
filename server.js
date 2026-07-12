@@ -20,6 +20,10 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN || null;
 const GITHUB_REPO = process.env.GITHUB_REPO || null;
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
 
+// Google Gemini (Nano Banana) for free image generation/editing.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || null;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-image";
+
 const MAX_BYTES = 15 * 1024 * 1024; // 15MB safety cap
 
 function isAllowedUrl(raw) {
@@ -162,6 +166,135 @@ function buildServer() {
 
       const rawUrl = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${path}`;
       return { content: [{ type: "text", text: rawUrl }] };
+    }
+  );
+
+  server.registerTool(
+    "gemini_generate_image",
+    {
+      title: "Generate or edit an image with Gemini (free)",
+      description:
+        "Generates a new image from a text prompt, or edits an existing image, using " +
+        "Google's Gemini image model (no cost, uses Google AI Studio's free quota, " +
+        "separate from Hugging Face's ZeroGPU quota). For editing, provide the source " +
+        "image either as a public URL (input_image_url, must be an allowed host) or as " +
+        "raw base64 (input_image_b64) — base64 is preferred for private/personal photos " +
+        "since it never touches any public storage.",
+      inputSchema: {
+        prompt: z.string().describe("Text description of the image to generate, or the edit to apply"),
+        input_image_url: z
+          .string()
+          .url()
+          .optional()
+          .describe("Optional: public URL of an image to edit (must be an allowed host)"),
+        input_image_b64: z
+          .string()
+          .optional()
+          .describe("Optional: raw base64 image data to edit, as an alternative to input_image_url"),
+        input_mime_type: z
+          .string()
+          .optional()
+          .describe("MIME type of input_image_b64, e.g. 'image/jpeg'. Default image/jpeg."),
+        push_to_github: z
+          .boolean()
+          .optional()
+          .describe("If true, push the result to GitHub and return a raw URL instead of inline image content"),
+        filename: z
+          .string()
+          .regex(/^[a-zA-Z0-9._-]+$/)
+          .optional()
+          .describe("Required if push_to_github is true"),
+      },
+    },
+    async ({ prompt, input_image_url, input_image_b64, input_mime_type, push_to_github, filename }) => {
+      if (!GEMINI_API_KEY) {
+        return { isError: true, content: [{ type: "text", text: "Server missing GEMINI_API_KEY config." }] };
+      }
+
+      const parts = [{ text: prompt }];
+
+      if (input_image_url) {
+        if (!isAllowedUrl(input_image_url)) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Refused: host not on allowlist (${ALLOWED_HOST_SUFFIXES.join(", ")})` }],
+          };
+        }
+        const imgRes = await fetch(input_image_url);
+        if (!imgRes.ok) {
+          return { isError: true, content: [{ type: "text", text: `Fetch failed: HTTP ${imgRes.status}` }] };
+        }
+        const mimeType = imgRes.headers.get("content-type") || "image/jpeg";
+        const buf = Buffer.from(await imgRes.arrayBuffer());
+        parts.push({ inline_data: { mime_type: mimeType, data: buf.toString("base64") } });
+      } else if (input_image_b64) {
+        parts.push({ inline_data: { mime_type: input_mime_type || "image/jpeg", data: input_image_b64 } });
+      }
+
+      const geminiRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+        {
+          method: "POST",
+          headers: { "x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json" },
+          body: JSON.stringify({ contents: [{ parts }] }),
+        }
+      );
+
+      if (!geminiRes.ok) {
+        const errText = await geminiRes.text();
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Gemini API error: HTTP ${geminiRes.status} ${errText.slice(0, 400)}` }],
+        };
+      }
+
+      const data = await geminiRes.json();
+      const imgPart = data?.candidates?.[0]?.content?.parts?.find((p) => p.inlineData || p.inline_data);
+      const inline = imgPart?.inlineData || imgPart?.inline_data;
+
+      if (!inline?.data) {
+        const textPart = data?.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text;
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Gemini returned no image. ${textPart ? "Model said: " + textPart.slice(0, 300) : "Response: " + JSON.stringify(data).slice(0, 300)}`,
+            },
+          ],
+        };
+      }
+
+      const outMime = inline.mimeType || inline.mime_type || "image/png";
+      const outBuf = Buffer.from(inline.data, "base64");
+
+      if (push_to_github) {
+        if (!filename) {
+          return { isError: true, content: [{ type: "text", text: "filename is required when push_to_github is true." }] };
+        }
+        if (!GITHUB_TOKEN || !GITHUB_REPO) {
+          return { isError: true, content: [{ type: "text", text: "Server missing GITHUB_TOKEN / GITHUB_REPO config." }] };
+        }
+        const path = `relay-drops/${filename}`;
+        const apiUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${path}`;
+        const putRes = await fetch(apiUrl, {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${GITHUB_TOKEN}`,
+            Accept: "application/vnd.github+json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ message: `relay: gemini output ${filename}`, content: outBuf.toString("base64"), branch: GITHUB_BRANCH }),
+        });
+        if (!putRes.ok) {
+          const errText = await putRes.text();
+          return { isError: true, content: [{ type: "text", text: `GitHub push failed: HTTP ${putRes.status} ${errText.slice(0, 300)}` }] };
+        }
+        const rawUrl = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${path}`;
+        return { content: [{ type: "text", text: rawUrl }] };
+      }
+
+      return { content: [{ type: "image", data: outBuf.toString("base64"), mimeType: outMime }] };
     }
   );
 
